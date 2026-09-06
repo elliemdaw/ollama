@@ -1,7 +1,17 @@
 package client
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/ollama/ollama/manifest"
+	"github.com/ollama/ollama/parser"
+	"github.com/ollama/ollama/types/model"
+	"github.com/ollama/ollama/x/create"
 )
 
 func TestModelfileConfig(t *testing.T) {
@@ -28,6 +38,127 @@ func TestModelfileConfig(t *testing.T) {
 	}
 	if config.Renderer != "qwen3" {
 		t.Errorf("Renderer = %q, want %q", config.Renderer, "qwen3")
+	}
+}
+
+func TestNemotronNanoOmniMetadataInference(t *testing.T) {
+	dir := t.TempDir()
+	config := `{
+		"architectures": ["NemotronH_Nano_Omni_Reasoning_V3"],
+		"model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+		"vision_config": {"patch_size": 16},
+		"sound_config": {"model_type": "parakeet"},
+		"llm_config": {"model_type": "nemotron_h"}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := getParserName(dir), "nemotron-3-nano"; got != want {
+		t.Fatalf("parser = %q, want %q", got, want)
+	}
+	if got, want := getRendererName(dir), "nemotron-3-nano"; got != want {
+		t.Fatalf("renderer = %q, want %q", got, want)
+	}
+	caps := inferSafetensorsCapabilities(dir, getParserName(dir))
+	if !slices.Equal(caps, []string{"completion", "vision", "audio", "tools", "thinking"}) {
+		t.Fatalf("capabilities = %v, want completion/vision/audio/tools/thinking", caps)
+	}
+}
+
+func TestNemotron35MetadataInference(t *testing.T) {
+	dir := t.TempDir()
+	config := `{"architectures":["NemotronHForCausalLM"],"model_type":"nemotron_h"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "chat_template.jinja"), []byte("{reasoning effort: efficient}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := getParserName(dir), "nemotron-3.5-nano"; got != want {
+		t.Fatalf("parser = %q, want %q", got, want)
+	}
+	if got, want := getRendererName(dir), "nemotron-3.5-nano"; got != want {
+		t.Fatalf("renderer = %q, want %q", got, want)
+	}
+}
+
+func TestConfigFromModelfile(t *testing.T) {
+	modelfile, err := parser.ParseFile(strings.NewReader(`
+FROM ./model
+DRAFT ./assistant
+TEMPLATE {{ .Prompt }}
+REQUIRES 0.20.0
+PARAMETER temperature 0.7
+PARAMETER stop USER:
+PARAMETER stop ASSISTANT:
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	modelDir, mfConfig, err := ConfigFromModelfile(modelfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if modelDir != "./model" {
+		t.Fatalf("modelDir = %q, want %q", modelDir, "./model")
+	}
+
+	if mfConfig.Template != "{{ .Prompt }}" {
+		t.Fatalf("Template = %q, want %q", mfConfig.Template, "{{ .Prompt }}")
+	}
+
+	if mfConfig.Draft != "./assistant" {
+		t.Fatalf("Draft = %q, want %q", mfConfig.Draft, "./assistant")
+	}
+
+	if mfConfig.Requires != "0.20.0" {
+		t.Fatalf("Requires = %q, want %q", mfConfig.Requires, "0.20.0")
+	}
+
+	if got := mfConfig.Parameters["temperature"]; got != float32(0.7) {
+		t.Fatalf("temperature = %#v, want %v", got, float32(0.7))
+	}
+
+	if got := mfConfig.Parameters["stop"]; got == nil || len(got.([]string)) != 2 {
+		t.Fatalf("unexpected stop params: %#v", got)
+	}
+}
+
+func TestConfigFromModelfile_RequiresBelowMinimum(t *testing.T) {
+	modelfile, err := parser.ParseFile(strings.NewReader(`
+FROM ./model
+REQUIRES 0.14.0
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = ConfigFromModelfile(modelfile)
+	if err == nil {
+		t.Fatal("expected error for REQUIRES below minimum, got nil")
+	}
+	if !strings.Contains(err.Error(), "minimum supported version") {
+		t.Fatalf("error = %v, want error mentioning minimum supported version", err)
+	}
+}
+
+func TestConfigFromModelfile_RequiresInvalidSemver(t *testing.T) {
+	modelfile, err := parser.ParseFile(strings.NewReader(`
+FROM ./model
+REQUIRES not-a-version
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = ConfigFromModelfile(modelfile)
+	if err == nil {
+		t.Fatal("expected error for invalid semver, got nil")
+	}
+	if !strings.Contains(err.Error(), "valid semver") {
+		t.Fatalf("error = %v, want semver error", err)
 	}
 }
 
@@ -80,8 +211,8 @@ func TestMinOllamaVersion(t *testing.T) {
 	if MinOllamaVersion == "" {
 		t.Error("MinOllamaVersion should not be empty")
 	}
-	if MinOllamaVersion != "0.14.0" {
-		t.Errorf("MinOllamaVersion = %q, want %q", MinOllamaVersion, "0.14.0")
+	if MinOllamaVersion != "0.19.0" {
+		t.Errorf("MinOllamaVersion = %q, want %q", MinOllamaVersion, "0.19.0")
 	}
 }
 
@@ -109,17 +240,32 @@ func TestCreateModel_NotSafetensorsDir(t *testing.T) {
 	}
 }
 
+func TestCreateModel_DraftQuantizeRequiresDraft(t *testing.T) {
+	err := CreateModel(CreateOptions{
+		ModelName:     "test-model",
+		ModelDir:      t.TempDir(),
+		DraftQuantize: "mxfp8",
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "--draft-quantize requires a DRAFT model") {
+		t.Fatalf("error = %v, want draft-quantize requires DRAFT", err)
+	}
+}
+
 func TestCreateOptions(t *testing.T) {
 	opts := CreateOptions{
-		ModelName: "my-model",
-		ModelDir:  "/path/to/model",
-		Quantize:  "fp8",
+		ModelName:     "my-model",
+		ModelDir:      "/path/to/model",
+		Quantize:      "fp8",
+		DraftQuantize: "mxfp8",
 		Modelfile: &ModelfileConfig{
 			Template: "test",
 			System:   "system",
 			License:  "MIT",
 			Parser:   "qwen3-thinking",
 			Renderer: "qwen3",
+			Parameters: map[string]any{
+				"temperature": float32(0.7),
+			},
 		},
 	}
 
@@ -132,6 +278,9 @@ func TestCreateOptions(t *testing.T) {
 	if opts.Quantize != "fp8" {
 		t.Errorf("Quantize = %q, want %q", opts.Quantize, "fp8")
 	}
+	if opts.DraftQuantize != "mxfp8" {
+		t.Errorf("DraftQuantize = %q, want %q", opts.DraftQuantize, "mxfp8")
+	}
 	if opts.Modelfile == nil {
 		t.Error("Modelfile should not be nil")
 	}
@@ -143,6 +292,9 @@ func TestCreateOptions(t *testing.T) {
 	}
 	if opts.Modelfile.Renderer != "qwen3" {
 		t.Errorf("Modelfile.Renderer = %q, want %q", opts.Modelfile.Renderer, "qwen3")
+	}
+	if opts.Modelfile.Parameters["temperature"] != float32(0.7) {
+		t.Errorf("Modelfile.Parameters[temperature] = %v, want %v", opts.Modelfile.Parameters["temperature"], float32(0.7))
 	}
 }
 
@@ -236,6 +388,9 @@ func TestCreateOptions_Defaults(t *testing.T) {
 	if opts.Quantize != "" {
 		t.Errorf("Quantize should be empty by default, got %q", opts.Quantize)
 	}
+	if opts.DraftQuantize != "" {
+		t.Errorf("DraftQuantize should be empty by default, got %q", opts.DraftQuantize)
+	}
 
 	// Modelfile should default to nil
 	if opts.Modelfile != nil {
@@ -243,12 +398,673 @@ func TestCreateOptions_Defaults(t *testing.T) {
 	}
 }
 
-func TestQuantizeSupported(t *testing.T) {
-	// This just verifies the function exists and returns a boolean
-	// The actual value depends on build tags (mlx vs non-mlx)
-	supported := QuantizeSupported()
+func TestInferSafetensorsCapabilities(t *testing.T) {
+	tests := []struct {
+		name       string
+		configJSON string
+		want       []string
+	}{
+		{
+			name: "qwen3.5 text model",
+			configJSON: `{
+				"architectures": ["Qwen3_5ForCausalLM"],
+				"model_type": "qwen3"
+			}`,
+			want: []string{"completion", "thinking"},
+		},
+		{
+			name: "qwen3.5 multimodal model",
+			configJSON: `{
+				"architectures": ["Qwen3_5ForConditionalGeneration"],
+				"model_type": "qwen3",
+				"vision_config": {"hidden_size": 1024}
+			}`,
+			want: []string{"completion", "vision", "thinking"},
+		},
+		{
+			name: "model with audio config",
+			configJSON: `{
+				"architectures": ["Gemma4ForConditionalGeneration"],
+				"model_type": "gemma4",
+				"vision_config": {"hidden_size": 1024},
+				"audio_config": {"num_mel_bins": 128}
+			}`,
+			want: []string{"completion", "vision", "audio"},
+		},
+		{
+			name: "model with audio but no vision",
+			configJSON: `{
+				"architectures": ["SomeAudioModel"],
+				"model_type": "other",
+				"audio_config": {"num_mel_bins": 128}
+			}`,
+			want: []string{"completion", "audio"},
+		},
+		{
+			name: "model with sound config",
+			configJSON: `{
+				"architectures": ["SomeSoundModel"],
+				"model_type": "other",
+				"sound_config": {"model_type": "parakeet"}
+			}`,
+			want: []string{"completion", "audio"},
+		},
+		{
+			name: "non-qwen conditional generation model",
+			configJSON: `{
+				"architectures": ["SomeOtherForConditionalGeneration"],
+				"model_type": "other"
+			}`,
+			want: []string{"completion"},
+		},
+	}
 
-	// In non-mlx builds, this should be false
-	// We can't easily test both cases, so just verify it returns something
-	_ = supported
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tt.configJSON), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := inferSafetensorsCapabilities(dir, ""); !slices.Equal(got, tt.want) {
+				t.Fatalf("inferSafetensorsCapabilities() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreateModelfileLayersIncludesParameters(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	layers, err := createModelfileLayers(&ModelfileConfig{
+		Parameters: map[string]any{
+			"temperature": float32(0.7),
+			"stop":        []string{"USER:", "ASSISTANT:"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(layers) != 1 {
+		t.Fatalf("len(layers) = %d, want 1", len(layers))
+	}
+
+	if layers[0].MediaType != "application/vnd.ollama.image.params" {
+		t.Fatalf("MediaType = %q, want %q", layers[0].MediaType, "application/vnd.ollama.image.params")
+	}
+
+	blobPath, err := manifest.BlobsPath(layers[0].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(blobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["temperature"] != float64(0.7) {
+		t.Fatalf("temperature = %v, want %v", got["temperature"], float64(0.7))
+	}
+}
+
+func TestNewManifestWriter_PopulatesFileTypeFromEffectiveQuantize(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	opts := CreateOptions{
+		ModelName: "test-quantized",
+		ModelDir:  t.TempDir(),
+	}
+
+	writer := newManifestWriter(opts, []string{"completion"}, "qwen3", "qwen3")
+	class := create.Classification{Kind: create.SourceBlockFP8, Quantize: "mxfp8"}
+	if err := writer(opts.ModelName, create.LayerInfo{}, nil, class); err != nil {
+		t.Fatalf("newManifestWriter() error = %v", err)
+	}
+
+	name := model.ParseName(opts.ModelName)
+	mf, err := manifest.ParseNamedManifest(name)
+	if err != nil {
+		t.Fatalf("ParseNamedManifest() error = %v", err)
+	}
+
+	configPath, err := manifest.BlobsPath(mf.Config.Digest)
+	if err != nil {
+		t.Fatalf("BlobsPath() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	var cfg model.ConfigV2
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	if cfg.FileType != "mxfp8" {
+		t.Fatalf("FileType = %q, want %q", cfg.FileType, "mxfp8")
+	}
+}
+
+func TestNewManifestWriter_PopulatesGenerationDefaults(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	modelDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modelDir, "generation_config.json"), []byte(`{
+		"temperature": 0,
+		"top_k": 12,
+		"top_p": 0.7,
+		"min_p": 0.05,
+		"repetition_penalty": 1.2,
+		"penalty_last_n": -1
+	}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	opts := CreateOptions{
+		ModelName: "test-generation-defaults",
+		ModelDir:  modelDir,
+	}
+
+	writer := newManifestWriter(opts, []string{"completion"}, "qwen3", "qwen3")
+	if err := writer(opts.ModelName, create.LayerInfo{}, nil, create.Classification{}); err != nil {
+		t.Fatalf("newManifestWriter() error = %v", err)
+	}
+
+	name := model.ParseName(opts.ModelName)
+	mf, err := manifest.ParseNamedManifest(name)
+	if err != nil {
+		t.Fatalf("ParseNamedManifest() error = %v", err)
+	}
+
+	configPath, err := manifest.BlobsPath(mf.Config.Digest)
+	if err != nil {
+		t.Fatalf("BlobsPath() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	var cfg model.ConfigV2
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	check := func(key string, want any) {
+		t.Helper()
+		if got := cfg.GenerationDefaults[key]; got != want {
+			t.Fatalf("%s = %#v, want %#v", key, got, want)
+		}
+	}
+
+	check("temperature", float64(0))
+	check("top_k", float64(12))
+	check("top_p", float64(0.7))
+	check("min_p", float64(0.05))
+	check("repeat_penalty", float64(1.2))
+	check("repeat_last_n", float64(-1))
+}
+
+func TestNewManifestWriter_PopulatesDraftMetadata(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	draftDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(draftDir, "config.json"), []byte(`{"architectures":["DFlashDraftModel"],"model_type":"qwen3"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	opts := CreateOptions{
+		ModelName: "test-draft",
+		ModelDir:  t.TempDir(),
+		Modelfile: &ModelfileConfig{Draft: draftDir},
+	}
+
+	writer := newManifestWriter(opts, []string{"completion"}, "gemma4", "gemma4")
+	if err := writer(opts.ModelName, create.LayerInfo{}, nil, create.Classification{}); err != nil {
+		t.Fatalf("newManifestWriter() error = %v", err)
+	}
+
+	name := model.ParseName(opts.ModelName)
+	mf, err := manifest.ParseNamedManifest(name)
+	if err != nil {
+		t.Fatalf("ParseNamedManifest() error = %v", err)
+	}
+
+	configPath, err := manifest.BlobsPath(mf.Config.Digest)
+	if err != nil {
+		t.Fatalf("BlobsPath() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+
+	var cfg model.ConfigV2
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if cfg.Draft == nil {
+		t.Fatal("Draft metadata missing")
+	}
+	if cfg.Draft.TensorPrefix != "draft." || cfg.Draft.Config != "draft/config.json" {
+		t.Fatalf("Draft = %#v, want draft prefix/config", cfg.Draft)
+	}
+	if cfg.Draft.Architecture != "DFlashDraftModel" {
+		t.Fatalf("Draft architecture = %q, want DFlashDraftModel", cfg.Draft.Architecture)
+	}
+}
+
+func TestDetectCapabilities(t *testing.T) {
+	const thinkingTemplate = `{"chat_template": "{%- if '</think>' in content %}{{ content.split('</think>')[-1] }}{%- endif %}<think>\n</think>"}`
+	const instructTemplate = `{"chat_template": "{{ '<|im_start|>assistant\n' }}"}`
+
+	tests := []struct {
+		name          string
+		configJSON    string
+		tokenizerJSON string
+		want          modelCapabilities
+	}{
+		{
+			name:          "thinking from chat template",
+			configJSON:    `{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}`,
+			tokenizerJSON: thinkingTemplate,
+			want:          modelCapabilities{thinking: true},
+		},
+		{
+			name:          "instruct template has no thinking",
+			configJSON:    `{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}`,
+			tokenizerJSON: instructTemplate,
+			want:          modelCapabilities{thinking: false},
+		},
+		{
+			name:       "plain qwen3 without template has no thinking",
+			configJSON: `{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}`,
+			want:       modelCapabilities{thinking: false},
+		},
+		{
+			name:          "qwen3.5 moe always thinks without a thinking template",
+			configJSON:    `{"architectures": ["Qwen3_5MoeForConditionalGeneration"], "model_type": "qwen3_5_moe"}`,
+			tokenizerJSON: instructTemplate,
+			want:          modelCapabilities{thinking: true},
+		},
+		{
+			name:       "qwen3-next always thinks",
+			configJSON: `{"architectures": ["Qwen3NextForCausalLM"]}`,
+			want:       modelCapabilities{thinking: true},
+		},
+		{
+			name:       "qwen4 always thinks",
+			configJSON: `{"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp"}`,
+			want:       modelCapabilities{vision: false, thinking: true},
+		},
+		{
+			name:       "vision config",
+			configJSON: `{"architectures": ["Gemma4ForConditionalGeneration"], "vision_config": {}}`,
+			want:       modelCapabilities{vision: true},
+		},
+		{
+			name:       "flat vision flag",
+			configJSON: `{"architectures": ["MuseGlimmerForConditionalGeneration"], "model_type": "muse_glimmer", "has_vision": true}`,
+			want:       modelCapabilities{vision: true},
+		},
+		{
+			name:       "audio config",
+			configJSON: `{"architectures": ["Qwen3OmniForConditionalGeneration"], "audio_config": {}}`,
+			want:       modelCapabilities{audio: true},
+		},
+		{
+			name:       "llama has no extra capabilities",
+			configJSON: `{"architectures": ["LlamaForCausalLM"], "model_type": "llama"}`,
+			want:       modelCapabilities{},
+		},
+		{
+			name:       "invalid config json",
+			configJSON: `not json`,
+			want:       modelCapabilities{},
+		},
+		{
+			name: "missing files",
+			want: modelCapabilities{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.configJSON != "" {
+				if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tt.configJSON), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.tokenizerJSON != "" {
+				if err := os.WriteFile(filepath.Join(dir, "tokenizer_config.json"), []byte(tt.tokenizerJSON), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if got := detectCapabilities(dir); got != tt.want {
+				t.Errorf("detectCapabilities() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInferSafetensorsCapabilitiesFromParser(t *testing.T) {
+	tests := []struct {
+		name       string
+		parserName string
+		want       []string
+	}{
+		{
+			name:       "laguna tools and thinking",
+			parserName: "laguna",
+			want:       []string{"completion", "tools", "thinking"},
+		},
+		{
+			name:       "poolside tools and thinking",
+			parserName: "poolside-v1",
+			want:       []string{"completion", "tools", "thinking"},
+		},
+		{
+			name:       "functiongemma tools only",
+			parserName: "functiongemma",
+			want:       []string{"completion", "tools"},
+		},
+		{
+			name:       "glimmer tools and thinking",
+			parserName: "glimmer",
+			want:       []string{"completion", "tools", "thinking"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := inferSafetensorsCapabilities(dir, tt.parserName); !slices.Equal(got, tt.want) {
+				t.Fatalf("inferSafetensorsCapabilities() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInferSafetensorsCapabilitiesGlimmerPreservesVisionMetadata(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{
+		"architectures": ["MuseGlimmerForConditionalGeneration"],
+		"model_type": "muse_glimmer",
+		"has_vision": true
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := inferSafetensorsCapabilities(dir, "glimmer")
+	want := []string{"completion", "vision", "tools", "thinking"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("inferSafetensorsCapabilities() = %#v, want %#v", got, want)
+	}
+}
+
+func TestInferSafetensorsCapabilitiesLaguna(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := inferSafetensorsCapabilities(dir, "laguna")
+	for _, want := range []string{"completion", "tools", "thinking"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("capabilities %v missing %q", got, want)
+		}
+	}
+	if slices.Contains(got, "vision") || slices.Contains(got, "audio") {
+		t.Fatalf("unexpected non-text capability in %v", got)
+	}
+}
+
+func TestGetParserName(t *testing.T) {
+	tests := []struct {
+		name       string
+		configJSON string
+		want       string
+	}{
+		{
+			name:       "qwen3 model",
+			configJSON: `{"architectures": ["Qwen3ForCausalLM"]}`,
+			want:       "qwen3",
+		},
+		{
+			name:       "qwen3.5 model",
+			configJSON: `{"architectures": ["Qwen3_5ForConditionalGeneration"]}`,
+			want:       "qwen3.5",
+		},
+		{
+			name:       "qwen4 model",
+			configJSON: `{"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp"}`,
+			want:       "qwen3.5",
+		},
+		{
+			name:       "deepseek model",
+			configJSON: `{"architectures": ["DeepseekV3ForCausalLM"]}`,
+			want:       "deepseek3",
+		},
+		{
+			name:       "glm4 model",
+			configJSON: `{"architectures": ["GLM4ForCausalLM"]}`,
+			want:       "glm-4.7",
+		},
+		{
+			name:       "llama model (no parser)",
+			configJSON: `{"architectures": ["LlamaForCausalLM"]}`,
+			want:       "",
+		},
+		{
+			name:       "qwen3 via model_type",
+			configJSON: `{"model_type": "qwen3"}`,
+			want:       "qwen3",
+		},
+		{
+			name:       "laguna model",
+			configJSON: `{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`,
+			want:       "laguna",
+		},
+		{
+			name:       "glimmer model",
+			configJSON: `{"architectures": ["MuseGlimmerForConditionalGeneration"], "model_type": "muse_glimmer"}`,
+			want:       "glimmer",
+		},
+		{
+			name:       "nemotron text architecture",
+			configJSON: `{"architectures": ["NemotronHForCausalLM"], "model_type": "nemotron_h"}`,
+			want:       "nemotron-3-nano",
+		},
+		{
+			name:       "nemotron omni architecture",
+			configJSON: `{"architectures": ["NemotronH_Nano_Omni_Reasoning_V3"], "model_type": "NemotronH_Nano_Omni_Reasoning_V3"}`,
+			want:       "nemotron-3-nano",
+		},
+		{
+			name:       "nemotron nested llm config",
+			configJSON: `{"model_type": "nemotron_h_omni", "llm_config": {"model_type": "nemotron_h"}}`,
+			want:       "nemotron-3-nano",
+		},
+		{
+			name:       "no config",
+			configJSON: `{}`,
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "config.json"), []byte(tt.configJSON), 0o644)
+
+			if got := getParserName(dir); got != tt.want {
+				t.Errorf("getParserName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetRendererName(t *testing.T) {
+	tests := []struct {
+		name           string
+		configJSON     string
+		chatTemplate   string
+		standaloneOnly bool
+		want           string
+	}{
+		{
+			name:       "qwen3 model",
+			configJSON: `{"architectures": ["Qwen3ForCausalLM"]}`,
+			want:       "qwen3-coder",
+		},
+		{
+			name:       "qwen3.5 model",
+			configJSON: `{"architectures": ["Qwen3_5ForConditionalGeneration"]}`,
+			want:       "qwen3.5",
+		},
+		{
+			name:       "qwen4 model",
+			configJSON: `{"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp"}`,
+			want:       "qwen3.8",
+		},
+		{
+			name:         "qwen3.8 embedded template",
+			configJSON:   `{"architectures": ["Qwen3_5ForConditionalGeneration"]}`,
+			chatTemplate: `{% set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}{% if preserve_thinking %}{% endif %}`,
+			want:         "qwen3.8",
+		},
+		{
+			name:           "qwen3.8 standalone template",
+			configJSON:     `{"architectures": ["Qwen3_5ForConditionalGeneration"]}`,
+			chatTemplate:   `{% set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}{% if preserve_thinking %}{% endif %}`,
+			standaloneOnly: true,
+			want:           "qwen3.8",
+		},
+		{
+			name:       "deepseek model",
+			configJSON: `{"architectures": ["DeepseekV3ForCausalLM"]}`,
+			want:       "deepseek3",
+		},
+		{
+			name:       "glm4 model",
+			configJSON: `{"architectures": ["GLM4ForCausalLM"]}`,
+			want:       "glm-4.7",
+		},
+		{
+			name:       "llama model (no renderer)",
+			configJSON: `{"architectures": ["LlamaForCausalLM"]}`,
+			want:       "",
+		},
+		{
+			name:       "laguna model",
+			configJSON: `{"architectures": ["LagunaForCausalLM"], "model_type": "laguna"}`,
+			want:       "laguna",
+		},
+		{
+			name:       "glimmer model",
+			configJSON: `{"architectures": ["MuseGlimmerForConditionalGeneration"], "model_type": "muse_glimmer"}`,
+			want:       "glimmer",
+		},
+		{
+			name:       "nemotron text architecture",
+			configJSON: `{"architectures": ["NemotronHForCausalLM"], "model_type": "nemotron_h"}`,
+			want:       "nemotron-3-nano",
+		},
+		{
+			name:       "nemotron omni architecture",
+			configJSON: `{"architectures": ["NemotronH_Nano_Omni_Reasoning_V3"], "model_type": "NemotronH_Nano_Omni_Reasoning_V3"}`,
+			want:       "nemotron-3-nano",
+		},
+		{
+			name:       "nemotron nested llm config",
+			configJSON: `{"model_type": "nemotron_h_omni", "llm_config": {"model_type": "nemotron_h"}}`,
+			want:       "nemotron-3-nano",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(tt.configJSON), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tt.chatTemplate != "" {
+				if tt.standaloneOnly {
+					if err := os.WriteFile(filepath.Join(dir, "chat_template.jinja"), []byte(tt.chatTemplate), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					data, err := json.Marshal(map[string]string{"chat_template": tt.chatTemplate})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(dir, "tokenizer_config.json"), data, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			if got := getRendererName(dir); got != tt.want {
+				t.Errorf("getRendererName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetLagunaRendererParserName(t *testing.T) {
+	tests := []struct {
+		name         string
+		chatTemplate string
+		want         string
+	}{
+		{
+			name:         "v5",
+			chatTemplate: `{#- Iteration on laguna_glm_thinking_v5/chat_template.jinja -#}`,
+			want:         "laguna",
+		},
+		{
+			name:         "v8",
+			chatTemplate: `{#- Iteration on laguna_glm_thinking_v8/chat_template.jinja -#}`,
+			want:         "poolside-v1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"architectures":["LagunaForCausalLM"],"model_type":"laguna"}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "tokenizer_config.json"), []byte(`{"chat_template":"{% include 'chat_template.jinja' %}"}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "chat_template.jinja"), []byte(tt.chatTemplate), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := getParserName(dir); got != tt.want {
+				t.Errorf("getParserName() = %q, want %q", got, tt.want)
+			}
+			if got := getRendererName(dir); got != tt.want {
+				t.Errorf("getRendererName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }

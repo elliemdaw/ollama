@@ -1,5 +1,3 @@
-//go:build mlx
-
 package tokenizer
 
 import (
@@ -110,6 +108,38 @@ func TestSplitBySpecialTokensFallbackWithoutCache(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("split mismatch at %d: got %v want %v", i, got, want)
 		}
+	}
+}
+
+func TestAdjustWhitespaceBoundary(t *testing.T) {
+	tests := []struct {
+		name             string
+		part             string
+		boundary         int
+		spaceBeforePunct bool
+		want             int
+	}{
+		{name: "letter", part: "  word", boundary: 2, want: 1},
+		{name: "punctuation without optional prefix", part: "  }", boundary: 2, want: 2},
+		{name: "punctuation with optional prefix", part: "  }", boundary: 2, spaceBeforePunct: true, want: 1},
+		{name: "tab before letter", part: "\tword", boundary: 1, want: 0},
+		{name: "tab before mark", part: "\t\u0301", boundary: 1, spaceBeforePunct: true, want: 1},
+		{name: "tab before punctuation", part: "\t}", boundary: 1, spaceBeforePunct: true, want: 1},
+		{name: "number", part: "  1", boundary: 2, want: 2},
+		{name: "newline", part: " \nword", boundary: 2, want: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			curr := tokenMatch{end: tt.boundary}
+			next := tokenMatch{start: tt.boundary, end: len(tt.part)}
+
+			adjustWhitespaceBoundary(tt.part, &curr, &next, tt.spaceBeforePunct)
+
+			if curr.end != tt.want || next.start != tt.want {
+				t.Fatalf("boundary = (%d, %d), want (%d, %d)", curr.end, next.start, tt.want, tt.want)
+			}
+		})
 	}
 }
 

@@ -19,9 +19,6 @@ type Backend interface {
 
 	Load(ctx context.Context, progress func(float32)) error
 
-	// BackendMemory returns the memory allocations that were made for this model
-	BackendMemory() BackendMemory
-
 	Config() fs.Config
 	Get(name string) Tensor
 	NewContext() Context
@@ -65,9 +62,6 @@ type BackendParams struct {
 
 	// NumThreads sets the number of threads to use if running on the CPU
 	NumThreads int
-
-	// GPULayers is the set of layers to offload to GPUs
-	GPULayers GPULayersList
 
 	// FlashAttention indicates that we should use a fused flash attention kernel
 	FlashAttention FlashAttentionType
@@ -137,6 +131,7 @@ type Tensor interface {
 
 	Bytes() []byte
 	Floats() []float32
+	BackendGet() []float32
 
 	FromBytes([]byte)
 	FromFloats([]float32)
@@ -162,7 +157,9 @@ type Tensor interface {
 	AvgPool2D(ctx Context, k, s int, p float32) Tensor
 	Conv2D(ctx Context, weight Tensor, s0, s1, p0, p1, d0, d1 int) Tensor
 	Conv3D(ctx Context, weight Tensor, c, s0, s1, s2, p0, p1, p2, d0, d1, d2 int) Tensor
+	Conv1DDW(ctx Context, weight Tensor, s, p, d int) Tensor
 	SSMConv(ctx Context, kernel Tensor) Tensor
+	SSMScan(ctx Context, x, dt, A, B, C, ids Tensor) Tensor
 
 	IM2Col(ctx Context, weight Tensor, s0, s1, p0, p1, d0, d1 int) Tensor
 
@@ -186,6 +183,9 @@ type Tensor interface {
 	Contiguous(ctx Context, shape ...int) Tensor
 
 	Pad(ctx Context, shape ...int) Tensor
+	// PadExt pads with independent left/right amounts per dimension.
+	// Arguments: lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3 for dims 0-3.
+	PadExt(ctx Context, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3 int) Tensor
 
 	Stack(ctx Context, dim int, s ...Tensor) Tensor
 
@@ -194,6 +194,7 @@ type Tensor interface {
 	Concat(ctx Context, t2 Tensor, dim int) Tensor
 	Rows(ctx Context, t2 Tensor) Tensor
 	SetRows(ctx Context, src Tensor, idxs Tensor) Tensor
+	SetInplace(ctx Context, src Tensor, nb1, nb2, nb3, offset int) Tensor
 	Copy(ctx Context, t2 Tensor) Tensor
 	Duplicate(ctx Context) Tensor
 

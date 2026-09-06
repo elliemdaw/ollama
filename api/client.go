@@ -259,6 +259,10 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -368,6 +372,16 @@ func (c *Client) List(ctx context.Context) (*ListResponse, error) {
 	return &lr, nil
 }
 
+// ModelRecommendationsExperimental lists model recommendations from the local
+// server's experimental recommendations endpoint.
+func (c *Client) ModelRecommendationsExperimental(ctx context.Context) (*ModelRecommendationsResponse, error) {
+	var resp ModelRecommendationsResponse
+	if err := c.do(ctx, http.MethodGet, "/api/experimental/model-recommendations", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ListRunning lists running models.
 func (c *Client) ListRunning(ctx context.Context) (*ProcessResponse, error) {
 	var lr ProcessResponse
@@ -459,6 +473,26 @@ func (c *Client) CloudStatusExperimental(ctx context.Context) (*StatusResponse, 
 	return &status, nil
 }
 
+// WebSearchExperimental searches the web through the local server's
+// experimental web search endpoint.
+func (c *Client) WebSearchExperimental(ctx context.Context, req *WebSearchRequest) (*WebSearchResponse, error) {
+	var resp WebSearchResponse
+	if err := c.do(ctx, http.MethodPost, "/api/experimental/web_search", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// WebFetchExperimental fetches web page content through the local server's
+// experimental web fetch endpoint.
+func (c *Client) WebFetchExperimental(ctx context.Context, req *WebFetchRequest) (*WebFetchResponse, error) {
+	var resp WebFetchResponse
+	if err := c.do(ctx, http.MethodPost, "/api/experimental/web_fetch", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Signout will signout a client for a local ollama server.
 func (c *Client) Signout(ctx context.Context) error {
 	return c.do(ctx, http.MethodPost, "/api/signout", nil, nil)
@@ -475,26 +509,4 @@ func (c *Client) Whoami(ctx context.Context) (*UserResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
-}
-
-// AliasRequest is the request body for creating or updating a model alias.
-type AliasRequest struct {
-	Alias          string `json:"alias"`
-	Target         string `json:"target"`
-	PrefixMatching bool   `json:"prefix_matching,omitempty"`
-}
-
-// SetAliasExperimental creates or updates a model alias via the experimental aliases API.
-func (c *Client) SetAliasExperimental(ctx context.Context, req *AliasRequest) error {
-	return c.do(ctx, http.MethodPost, "/api/experimental/aliases", req, nil)
-}
-
-// AliasDeleteRequest is the request body for deleting a model alias.
-type AliasDeleteRequest struct {
-	Alias string `json:"alias"`
-}
-
-// DeleteAliasExperimental deletes a model alias via the experimental aliases API.
-func (c *Client) DeleteAliasExperimental(ctx context.Context, req *AliasDeleteRequest) error {
-	return c.do(ctx, http.MethodDelete, "/api/experimental/aliases", req, nil)
 }

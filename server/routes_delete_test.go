@@ -48,8 +48,7 @@ func TestDelete(t *testing.T) {
 	})
 
 	checkFileExists(t, filepath.Join(p, "blobs", "*"), []string{
-		filepath.Join(p, "blobs", "sha256-136bf7c76bac2ec09d6617885507d37829e04b41acc47687d45e512b544e893a"),
-		filepath.Join(p, "blobs", "sha256-6bcdb8859d417753645538d7bbfbd7ca91a3f0c191aef5379c53c05e86b669dd"),
+		filepath.Join(p, "blobs", "sha256-99759ad5b91e723db0393d698ffbb448b1b7df5ff6377a108c49254583b1bc8c"),
 		filepath.Join(p, "blobs", "sha256-89a2116c3a82d6a97f59f748d86ed4417214353fd178ee54df418fde32495fad"),
 		filepath.Join(p, "blobs", "sha256-fe7ac77b725cda2ccad03f88a880ecdfd7a33192d6cae08fce2c0ee1455991ed"),
 	})
@@ -65,7 +64,7 @@ func TestDelete(t *testing.T) {
 	})
 
 	checkFileExists(t, filepath.Join(p, "blobs", "*"), []string{
-		filepath.Join(p, "blobs", "sha256-136bf7c76bac2ec09d6617885507d37829e04b41acc47687d45e512b544e893a"),
+		filepath.Join(p, "blobs", "sha256-99759ad5b91e723db0393d698ffbb448b1b7df5ff6377a108c49254583b1bc8c"),
 		filepath.Join(p, "blobs", "sha256-89a2116c3a82d6a97f59f748d86ed4417214353fd178ee54df418fde32495fad"),
 		filepath.Join(p, "blobs", "sha256-fe7ac77b725cda2ccad03f88a880ecdfd7a33192d6cae08fce2c0ee1455991ed"),
 	})
@@ -107,6 +106,35 @@ func TestDeleteDuplicateLayers(t *testing.T) {
 	w := createRequest(t, s.DeleteHandler, api.DeleteRequest{Name: "test"})
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status code 200, actual %d", w.Code)
+	}
+
+	checkFileExists(t, filepath.Join(p, "manifests", "*", "*", "*", "*"), []string{})
+}
+
+func TestDeleteCloudSourceNormalizesToLegacyName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	p := t.TempDir()
+	t.Setenv("OLLAMA_MODELS", p)
+
+	var s Server
+
+	_, digest := createBinFile(t, nil, nil)
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Name:  "gpt-oss:20b-cloud",
+		Files: map[string]string{"test.gguf": digest},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status code 200, actual %d", w.Code)
+	}
+
+	checkFileExists(t, filepath.Join(p, "manifests", "*", "*", "*", "*"), []string{
+		filepath.Join(p, "manifests", "registry.ollama.ai", "library", "gpt-oss", "20b-cloud"),
+	})
+
+	w = createRequest(t, s.DeleteHandler, api.DeleteRequest{Name: "gpt-oss:20b:cloud"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status code 200, actual %d (%s)", w.Code, w.Body.String())
 	}
 
 	checkFileExists(t, filepath.Join(p, "manifests", "*", "*", "*", "*"), []string{})

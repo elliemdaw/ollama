@@ -1,5 +1,3 @@
-//go:build mlx
-
 package mlx
 
 // #include "generated.h"
@@ -7,48 +5,43 @@ import "C"
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"reflect"
+	"sort"
 	"strings"
-	"time"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/ollama/ollama/logutil"
 )
 
-type tensorDesc struct {
-	name    string
-	inputs  []*Array
-	numRefs int
-}
-
-func (d tensorDesc) LogValue() slog.Value {
-	return slog.GroupValue(
-		slog.String("name", d.name),
-		slog.Int("inputs", len(d.inputs)),
-		slog.Int("num_refs", d.numRefs),
-	)
-}
-
 type Array struct {
-	ctx  C.mlx_array
-	desc tensorDesc
+	ctx    C.mlx_array
+	name   string
+	pinned atomic.Int32
 }
+
+var (
+	arrays   []*Array
+	arraysMu sync.Mutex
+)
 
 // constructor utilities
 
-func New(name string, inputs ...*Array) *Array {
-	t := &Array{
-		desc: tensorDesc{
-			name:   name,
-			inputs: inputs,
-		},
+func New(name string) *Array {
+	t := &Array{name: name}
+
+	if tracing {
+		traceScratch = append(traceScratch, t)
+	} else {
+		arraysMu.Lock()
+		defer arraysMu.Unlock()
+
+		arrays = append(arrays, t)
 	}
 
-	for _, input := range inputs {
-		input.desc.numRefs++
-	}
-	logutil.Trace("New", "t", t)
 	return t
 }
 
@@ -60,15 +53,15 @@ func FromValue[T scalarTypes](t T) *Array {
 	tt := New("")
 	switch v := any(t).(type) {
 	case bool:
-		tt.ctx = C.mlx_array_new_bool(C.bool(v))
+		tt.ctx = mlxCheck(C.mlx_array_new_bool(C.bool(v)))
 	case int:
-		tt.ctx = C.mlx_array_new_int(C.int(v))
+		tt.ctx = mlxCheck(C.mlx_array_new_int(C.int(v)))
 	case float32:
-		tt.ctx = C.mlx_array_new_float32(C.float(v))
+		tt.ctx = mlxCheck(C.mlx_array_new_float32(C.float(v)))
 	case float64:
-		tt.ctx = C.mlx_array_new_float64(C.double(v))
+		tt.ctx = mlxCheck(C.mlx_array_new_float64(C.double(v)))
 	case complex64:
-		tt.ctx = C.mlx_array_new_complex(C.float(real(v)), C.float(imag(v)))
+		tt.ctx = mlxCheck(C.mlx_array_new_complex(C.float(real(v)), C.float(imag(v))))
 	default:
 		panic("unsupported type")
 	}
@@ -128,21 +121,58 @@ func FromValues[S ~[]E, E arrayTypes](s S, shape ...int) *Array {
 	}
 
 	tt := New("")
-	tt.ctx = C.mlx_array_new_data(unsafe.Pointer(&bts[0]), unsafe.SliceData(cShape), C.int(len(cShape)), C.mlx_dtype(dtype))
+	tt.ctx = mlxCheck(C.mlx_array_new_data(unsafe.Pointer(&bts[0]), unsafe.SliceData(cShape), C.int(len(cShape)), C.mlx_dtype(dtype)))
 	return tt
 }
 
 func (t *Array) Set(other *Array) {
-	Free(t.desc.inputs...)
-	other.desc.numRefs++
-	t.desc.inputs = []*Array{other}
-	C.mlx_array_set(&t.ctx, other.ctx)
+	mlxCheck(C.mlx_array_set(&t.ctx, other.ctx))
 }
 
 func (t *Array) Clone() *Array {
-	tt := New(t.desc.name, t.desc.inputs...)
-	C.mlx_array_set(&tt.ctx, t.ctx)
+	tt := New(t.name)
+	mlxCheck(C.mlx_array_set(&tt.ctx, t.ctx))
 	return tt
+}
+
+// lifecycle utilities
+
+// Pin marks arrays as in-use so they are retained during Sweep.
+func Pin(s ...*Array) {
+	for _, t := range s {
+		if t != nil {
+			t.pinned.Add(1)
+		}
+	}
+}
+
+// Unpin marks arrays as no longer in-use, allowing Sweep to free them.
+func Unpin(s ...*Array) {
+	for _, t := range s {
+		if t != nil {
+			if t.pinned.Add(-1) < 0 {
+				panic(fmt.Sprintf("mlx.Unpin: negative pin count on array %q", t.name))
+			}
+		}
+	}
+}
+
+// Sweep releases all unpinned arrays, primarily intermediate tensors. MLX will truly
+// free them when there are no other references, including dependencies in the graph.
+func Sweep() {
+	arraysMu.Lock()
+	defer arraysMu.Unlock()
+	n := 0
+	for _, t := range arrays {
+		if t.pinned.Load() > 0 && t.Valid() {
+			arrays[n] = t
+			n++
+		} else if t.Valid() {
+			mlxCheck(C.mlx_array_free(t.ctx))
+			t.ctx.ctx = nil
+		}
+	}
+	arrays = arrays[:n]
 }
 
 // misc. utilities
@@ -152,14 +182,17 @@ func (t *Array) Valid() bool {
 }
 
 func (t *Array) String() string {
-	str := C.mlx_string_new()
-	defer C.mlx_string_free(str)
-	C.mlx_array_tostring(&str, t.ctx)
-	return strings.TrimSpace(C.GoString(C.mlx_string_data(str)))
+	str := mlxCheck(C.mlx_string_new())
+	mlxCheck(C.mlx_array_tostring(&str, t.ctx))
+	defer freeString(str)
+	return strings.TrimSpace(C.GoString(mlxCheck(C.mlx_string_data(str))))
 }
 
 func (t *Array) LogValue() slog.Value {
-	attrs := []slog.Attr{slog.Any("", t.desc)}
+	attrs := []slog.Attr{
+		slog.String("name", t.name),
+		slog.Int("pinned", int(t.pinned.Load())),
+	}
 	if t.Valid() {
 		attrs = append(attrs,
 			slog.Any("dtype", t.DType()),
@@ -172,19 +205,19 @@ func (t *Array) LogValue() slog.Value {
 
 // shape utilities
 
-func (t Array) Size() int {
-	return int(C.mlx_array_size(t.ctx))
+func (t *Array) Size() int {
+	return int(mlxCheck(C.mlx_array_size(t.ctx)))
 }
 
-func (t Array) NumBytes() int {
-	return int(C.mlx_array_nbytes(t.ctx))
+func (t *Array) NumBytes() int {
+	return int(mlxCheck(C.mlx_array_nbytes(t.ctx)))
 }
 
-func (t Array) NumDims() int {
-	return int(C.mlx_array_ndim(t.ctx))
+func (t *Array) NumDims() int {
+	return int(mlxCheck(C.mlx_array_ndim(t.ctx)))
 }
 
-func (t Array) Dims() []int {
+func (t *Array) Dims() []int {
 	dims := make([]int, t.NumDims())
 	for i := range dims {
 		dims[i] = t.Dim(i)
@@ -193,82 +226,82 @@ func (t Array) Dims() []int {
 	return dims
 }
 
-func (t Array) Dim(dim int) int {
-	return int(C.mlx_array_dim(t.ctx, C.int(dim)))
+func (t *Array) Dim(dim int) int {
+	n := C.mlx_array_dim(t.ctx, C.int(dim))
+	if err := lastError(); err != nil {
+		panic(err)
+	}
+	return int(n)
 }
 
-func (t Array) DType() DType {
-	return DType(C.mlx_array_dtype(t.ctx))
+func (t *Array) DType() DType {
+	return DType(mlxCheck(C.mlx_array_dtype(t.ctx)))
 }
 
 // data utilities
 
-func (t Array) Int() int {
-	var item C.int64_t
-	C.mlx_array_item_int64(&item, t.ctx)
-	return int(item)
-}
-
-func (t Array) Float() float64 {
-	var item C.double
-	C.mlx_array_item_float64(&item, t.ctx)
-	return float64(item)
-}
-
-func (t Array) Ints() []int {
-	ints := make([]int, t.Size())
-	for i, f := range unsafe.Slice(C.mlx_array_data_int32(t.ctx), len(ints)) {
-		ints[i] = int(f)
+func (t *Array) Int() int32 {
+	if dt := t.DType(); dt != DTypeInt32 {
+		panic(fmt.Sprintf("mlx: Int requires a DTypeInt32 array, got %v", dt))
 	}
+	var item C.int32_t
+	mlxCheck(C.mlx_array_item_int32(&item, t.ctx))
+	return int32(item)
+}
+
+func (t *Array) Float() float32 {
+	if dt := t.DType(); dt != DTypeFloat32 {
+		panic(fmt.Sprintf("mlx: Float requires a DTypeFloat32 array, got %v", dt))
+	}
+	var item C.float
+	mlxCheck(C.mlx_array_item_float32(&item, t.ctx))
+	return float32(item)
+}
+
+func (t *Array) Ints() []int32 {
+	if dt := t.DType(); dt != DTypeInt32 {
+		panic(fmt.Sprintf("mlx: Ints requires DTypeInt32, got %v", dt))
+	}
+	Eval(t)
+	data := mlxCheck(C.mlx_array_data_int32(t.ctx))
+	ints := make([]int32, t.Size())
+	copy(ints, unsafe.Slice((*int32)(unsafe.Pointer(data)), len(ints)))
 	return ints
 }
 
-func (t Array) Floats() []float32 {
-	floats := make([]float32, t.Size())
-	for i, f := range unsafe.Slice(C.mlx_array_data_float32(t.ctx), len(floats)) {
-		floats[i] = float32(f)
+func (t *Array) Floats() []float32 {
+	if dt := t.DType(); dt != DTypeFloat32 {
+		panic(fmt.Sprintf("mlx: Floats requires DTypeFloat32, got %v", dt))
 	}
+	Eval(t)
+	data := mlxCheck(C.mlx_array_data_float32(t.ctx))
+	floats := make([]float32, t.Size())
+	copy(floats, unsafe.Slice((*float32)(unsafe.Pointer(data)), len(floats)))
 	return floats
 }
 
-func (t Array) Save(name string) error {
+func (t *Array) Save(name string) error {
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
-	C.mlx_save(cName, t.ctx)
+	if err := mlxError(C.mlx_save(cName, t.ctx)); err != nil {
+		return fmt.Errorf("failed to save array to %s: %w", name, err)
+	}
 	return nil
 }
 
-func Free(s ...*Array) (n int) {
-	now := time.Now()
-	defer func() {
-		if n > 0 {
-			logutil.Trace("Freed tensors", "num_bytes", PrettyBytes(n), "took", time.Since(now))
-		}
-	}()
+// LogArrays logs all live arrays, sorted by size
+func LogArrays() {
+	arraysMu.Lock()
+	defer arraysMu.Unlock()
+	sort.Slice(arrays, func(i, j int) bool {
+		return arrays[i].NumBytes() > arrays[j].NumBytes()
+	})
 
-	free := make([]*Array, 0, 8192)
-	fn := func(t *Array) {
-		if t.Valid() {
-			t.desc.numRefs--
-			if t.desc.numRefs <= 0 {
-				free = append(free, t.desc.inputs...)
-				logutil.Trace("Free", "t", t)
-				n += t.NumBytes()
-				C.mlx_array_free(t.ctx)
-				t.ctx.ctx = nil
-			}
-		}
+	var total int
+	for _, t := range arrays {
+		nb := t.NumBytes()
+		total += nb
+		logutil.Trace(fmt.Sprintf("tensor %-60s %5s %5s pinned=%d %v", t.name, t.DType(), PrettyBytes(nb), t.pinned.Load(), t.Dims()))
 	}
-
-	for _, t := range s {
-		fn(t)
-	}
-
-	for len(free) > 0 {
-		tail := free[len(free)-1]
-		free = free[:len(free)-1]
-		fn(tail)
-	}
-
-	return n
+	logutil.Trace(fmt.Sprintf("tensors total: %d, size: %s, active: %s", len(arrays), PrettyBytes(total), PrettyBytes(ActiveMemory())))
 }

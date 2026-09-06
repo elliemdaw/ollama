@@ -1,5 +1,3 @@
-//go:build mlx
-
 package nn
 
 import "github.com/ollama/ollama/x/mlxrunner/mlx"
@@ -15,6 +13,47 @@ type LinearLayer interface {
 	OutputDim() int32
 }
 
+// EmbeddingLayer is an interface for embedding layers that can also expose a
+// tied-output projection when the model reuses embedding weights as the LM head.
+type EmbeddingLayer interface {
+	Forward(indices *mlx.Array) *mlx.Array
+	AsLinear() LinearLayer
+}
+
+// Conv1d applies 1D convolution over NLC input.
+type Conv1d struct {
+	Weight   *mlx.Array
+	Bias     *mlx.Array
+	Stride   int32
+	Padding  int32
+	Dilation int32
+	Groups   int32
+}
+
+func NewConv1d(weight, bias *mlx.Array, stride, padding, dilation, groups int32) *Conv1d {
+	if stride <= 0 {
+		stride = 1
+	}
+	if dilation <= 0 {
+		dilation = 1
+	}
+	if groups <= 0 {
+		groups = 1
+	}
+	return &Conv1d{
+		Weight:   weight,
+		Bias:     bias,
+		Stride:   stride,
+		Padding:  padding,
+		Dilation: dilation,
+		Groups:   groups,
+	}
+}
+
+func (c *Conv1d) Forward(x *mlx.Array) *mlx.Array {
+	return mlx.Conv1d(x, c.Weight, c.Bias, c.Stride, c.Padding, c.Dilation, c.Groups)
+}
+
 // Linear applies an affine transformation: y = x @ W.T + b
 type Linear struct {
 	Weight *mlx.Array
@@ -22,6 +61,9 @@ type Linear struct {
 }
 
 func NewLinear(weight *mlx.Array, bias *mlx.Array) *Linear {
+	if bias != nil && bias.Valid() && bias.DType() != weight.DType() {
+		bias = bias.AsType(weight.DType())
+	}
 	return &Linear{Weight: weight, Bias: bias}
 }
 
@@ -39,13 +81,14 @@ func (l *Linear) OutputDim() int32 {
 
 // QuantizedLinear applies an affine transformation using quantized weights.
 type QuantizedLinear struct {
-	Weight    *mlx.Array // Quantized weight data
-	Scales    *mlx.Array // Scale factors for dequantization
-	QBiases   *mlx.Array // Quantization biases (nil for nvfp4)
-	Bias      *mlx.Array // Layer bias [output_dims] or nil
-	GroupSize int
-	Bits      int
-	Mode      string
+	Weight      *mlx.Array // Quantized weight data
+	Scales      *mlx.Array // Scale factors for dequantization
+	QBiases     *mlx.Array // Quantization biases (nil for nvfp4)
+	Bias        *mlx.Array // Layer bias [output_dims] or nil
+	GlobalScale *mlx.Array // Per-tensor or per-row global scale for double-scale nvfp4 (nil for standard)
+	GroupSize   int
+	Bits        int
+	Mode        string
 }
 
 func NewQuantizedLinear(weight *mlx.Array, bias *mlx.Array, groupSize, bits int, mode string) *QuantizedLinear {
@@ -54,6 +97,9 @@ func NewQuantizedLinear(weight *mlx.Array, bias *mlx.Array, groupSize, bits int,
 		mlx.Eval(qw, scales, qbiases)
 	} else {
 		mlx.Eval(qw, scales)
+	}
+	if bias != nil && bias.Valid() && bias.DType() != weight.DType() {
+		bias = bias.AsType(weight.DType())
 	}
 	return &QuantizedLinear{
 		Weight:    qw,
@@ -66,10 +112,30 @@ func NewQuantizedLinear(weight *mlx.Array, bias *mlx.Array, groupSize, bits int,
 	}
 }
 
+var quantizedLinearOutputScale = mlx.Compile2(
+	"QuantizedLinearOutputScale",
+	func(out, scale *mlx.Array) *mlx.Array {
+		return mlx.Mul(out, scale).AsType(out.DType())
+	},
+	mlx.Shapeless(),
+)
+
 func (ql *QuantizedLinear) Forward(x *mlx.Array) *mlx.Array {
 	out := mlx.QuantizedMatmul(x, ql.Weight, ql.Scales, ql.QBiases, true, ql.GroupSize, ql.Bits, ql.Mode)
+	if ql.GlobalScale != nil {
+		// Double-scale nvfp4 (e.g., NVIDIA ModelOpt): standard quantized_matmul
+		// followed by global_scale multiply. The global_scale is F32, per-tensor
+		// (weight_scale_2 in NVIDIA's format) or per-row.
+		// TODO: switch to a fused double-scale matmul once MLX has kernel
+		// coverage for this path.
+		out = quantizedLinearOutputScale(out, ql.GlobalScale)
+	}
 	if ql.Bias != nil && ql.Bias.Valid() {
-		out = out.Add(ql.Bias)
+		bias := ql.Bias
+		if bias.DType() != out.DType() {
+			bias = bias.AsType(out.DType())
+		}
+		out = out.Add(bias)
 	}
 	return out
 }
@@ -108,6 +174,44 @@ func (e *Embedding) Forward(indices *mlx.Array) *mlx.Array {
 	return e.Weight.TakeAxis(indices, 0)
 }
 
+func (e *Embedding) AsLinear() LinearLayer {
+	return NewLinear(e.Weight, nil)
+}
+
+// QuantizedEmbedding performs row-wise embedding lookup from affine/nvfp4/etc.
+// packed weights and dequantizes only the selected rows.
+type QuantizedEmbedding struct {
+	Weight      *mlx.Array
+	Scales      *mlx.Array
+	QBiases     *mlx.Array
+	GlobalScale *mlx.Array // Per-tensor global scale for double-scale nvfp4 (nil for standard)
+	GroupSize   int
+	Bits        int
+	Mode        string
+}
+
+func (qe *QuantizedEmbedding) Forward(indices *mlx.Array) *mlx.Array {
+	weight := qe.Weight.TakeAxis(indices, 0)
+	scales := qe.Scales.TakeAxis(indices, 0)
+	var qbiases *mlx.Array
+	if qe.QBiases != nil && qe.QBiases.Valid() {
+		qbiases = qe.QBiases.TakeAxis(indices, 0)
+	}
+	return mlx.Dequantize(weight, scales, qbiases, qe.GroupSize, qe.Bits, qe.Mode, qe.GlobalScale)
+}
+
+func (qe *QuantizedEmbedding) AsLinear() LinearLayer {
+	return &QuantizedLinear{
+		Weight:      qe.Weight,
+		Scales:      qe.Scales,
+		QBiases:     qe.QBiases,
+		GlobalScale: qe.GlobalScale,
+		GroupSize:   qe.GroupSize,
+		Bits:        qe.Bits,
+		Mode:        qe.Mode,
+	}
+}
+
 // LayerNorm represents a standard layer normalization layer (with bias).
 type LayerNorm struct {
 	Weight *mlx.Array
@@ -120,15 +224,7 @@ func (ln *LayerNorm) Forward(x *mlx.Array) *mlx.Array {
 	if eps == 0 {
 		eps = 1e-5
 	}
-	mean := mlx.Mean(x, -1, true)
-	centered := x.Subtract(mean)
-	variance := mlx.Mean(centered.Multiply(centered), -1, true)
-	normalized := centered.Multiply(mlx.RSqrt(mlx.AddScalar(variance, eps)))
-	out := normalized.Multiply(ln.Weight)
-	if ln.Bias != nil && ln.Bias.Valid() {
-		out = out.Add(ln.Bias)
-	}
-	return out
+	return mlx.LayerNormFn(x, ln.Weight, ln.Bias, eps)
 }
 
 // MultiLinearLayer is an interface for per-head linear layers.
@@ -149,18 +245,6 @@ func NewMultiLinear(weight *mlx.Array) *MultiLinear {
 func (ml *MultiLinear) Forward(x *mlx.Array) *mlx.Array {
 	wT := ml.Weight.Transpose(0, 2, 1)
 	return x.Matmul(wT)
-}
-
-// RepeatKV repeats K/V tensors for grouped query attention.
-func RepeatKV(x *mlx.Array, repeatFactor int32) *mlx.Array {
-	if repeatFactor == 1 {
-		return x
-	}
-	shape := x.Dims()
-	x = x.ExpandDims(2)
-	reps := []int32{1, 1, repeatFactor, 1, 1}
-	x = mlx.Tile(x, reps)
-	return mlx.Reshape(x, int32(shape[0]), int32(shape[1])*repeatFactor, int32(shape[2]), int32(shape[3]))
 }
 
 // ApplyCausalMask applies causal (lower triangular) mask to attention scores.

@@ -29,9 +29,10 @@ const (
 )
 
 type Qwen3CoderParser struct {
-	state qwenParserState
-	acc   strings.Builder
-	tools []api.Tool
+	state     qwenParserState
+	acc       strings.Builder
+	tools     []api.Tool
+	callIndex int
 }
 
 func (p *Qwen3CoderParser) HasToolSupport() bool {
@@ -42,8 +43,16 @@ func (p *Qwen3CoderParser) HasThinkingSupport() bool {
 	return false
 }
 
+func (p *Qwen3CoderParser) PreservedTokens() []string {
+	return []string{
+		toolOpenTag,
+		toolCloseTag,
+	}
+}
+
 func (p *Qwen3CoderParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
+	p.callIndex = 0
 	return tools // Qwen doesn't modify tools
 }
 
@@ -62,6 +71,8 @@ func (p *Qwen3CoderParser) Add(s string, done bool) (content string, thinking st
 				slog.Warn("qwen tool call parsing failed", "error", err)
 				return "", "", nil, err
 			}
+			toolCall.Function.Index = p.callIndex
+			p.callIndex++
 			toolCalls = append(toolCalls, toolCall)
 		case qwenEventContent:
 			// TODO(drifkin): if the same turn contains multiple interleaved content
@@ -283,7 +294,10 @@ func parseValue(raw string, paramType api.PropertyType) any {
 	// they exist). This follows the reference implementation
 	raw = strings.TrimPrefix(raw, "\n")
 	raw = strings.TrimSuffix(raw, "\n")
+	return parseTypedToolValue(raw, paramType)
+}
 
+func parseTypedToolValue(raw string, paramType api.PropertyType) any {
 	// Check for null first (case-insensitive) - this takes precedence over any type
 	if strings.ToLower(raw) == "null" {
 		return nil
