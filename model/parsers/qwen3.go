@@ -38,6 +38,7 @@ type Qwen3Parser struct {
 	state                  qwen3ParserState
 	buffer                 strings.Builder
 	tools                  []api.Tool
+	callIndex              int
 	hasThinkingSupport     bool
 	defaultThinking        bool
 	maybeThinkingOpenAtBOL bool
@@ -51,9 +52,19 @@ func (p *Qwen3Parser) HasThinkingSupport() bool {
 	return p.hasThinkingSupport
 }
 
+func (p *Qwen3Parser) PreservedTokens() []string {
+	return []string{
+		qwen3ThinkingOpenTag,
+		qwen3ThinkingCloseTag,
+		qwen3ToolOpenTag,
+		qwen3ToolCloseTag,
+	}
+}
+
 func (p *Qwen3Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
 	p.buffer.Reset()
+	p.callIndex = 0
 
 	thinkingEnabled := thinkValue != nil && thinkValue.Bool()
 	if thinkValue == nil {
@@ -106,6 +117,8 @@ func (p *Qwen3Parser) Add(s string, done bool) (content string, thinking string,
 				slog.Warn("qwen3 tool call parsing failed", "error", err)
 				return "", "", nil, err
 			}
+			toolCall.Function.Index = p.callIndex
+			p.callIndex++
 			calls = append(calls, toolCall)
 		case qwen3EventThinkingContent:
 			thinkingSb.WriteString(event.content)
@@ -204,6 +217,24 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 			p.maybeThinkingOpenAtBOL = false
 		}
 
+		thinkingCloseIdx := strings.Index(acc, qwen3ThinkingCloseTag)
+		toolOpenIdx := strings.Index(acc, qwen3ToolOpenTag)
+
+		// If a tool call starts before </think>, treat that as the end of thinking
+		// for parsing purposes and continue in tool-call mode.
+		if toolOpenIdx != -1 && (thinkingCloseIdx == -1 || toolOpenIdx < thinkingCloseIdx) {
+			before, after := p.splitAtTag(qwen3ToolOpenTag, true)
+			if len(before) > 0 {
+				events = append(events, qwen3EventThinkingContent{content: before})
+			}
+			if after == "" {
+				p.state = qwen3ParserStateToolStartedEatingWhitespace
+			} else {
+				p.state = qwen3ParserStateCollectingToolContent
+			}
+			return events, true
+		}
+
 		if strings.Contains(acc, qwen3ThinkingCloseTag) {
 			thinking, remaining := p.splitAtTag(qwen3ThinkingCloseTag, true)
 			if len(thinking) > 0 {
@@ -215,7 +246,7 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 				p.state = qwen3ParserStateCollectingContent
 			}
 			return events, true
-		} else if overlapLen := overlap(acc, qwen3ThinkingCloseTag); overlapLen > 0 {
+		} else if overlapLen := max(overlap(acc, qwen3ThinkingCloseTag), overlap(acc, qwen3ToolOpenTag)); overlapLen > 0 {
 			beforePartialTag := acc[:len(acc)-overlapLen]
 			trailingWsLen := trailingWhitespaceLen(beforePartialTag)
 			ambiguousStart := len(beforePartialTag) - trailingWsLen
@@ -306,8 +337,8 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 
 func parseQwen3ToolCall(raw qwen3EventRawToolCall, tools []api.Tool) (api.ToolCall, error) {
 	var parsed struct {
-		Name      string         `json:"name"`
-		Arguments map[string]any `json:"arguments"`
+		Name      string                        `json:"name"`
+		Arguments api.ToolCallFunctionArguments `json:"arguments"`
 	}
 
 	if err := json.Unmarshal([]byte(raw.raw), &parsed); err != nil {
@@ -323,12 +354,8 @@ func parseQwen3ToolCall(raw qwen3EventRawToolCall, tools []api.Tool) (api.ToolCa
 	toolCall := api.ToolCall{
 		Function: api.ToolCallFunction{
 			Name:      parsed.Name,
-			Arguments: api.NewToolCallFunctionArguments(),
+			Arguments: parsed.Arguments,
 		},
-	}
-
-	for key, value := range parsed.Arguments {
-		toolCall.Function.Arguments.Set(key, value)
 	}
 
 	return toolCall, nil
